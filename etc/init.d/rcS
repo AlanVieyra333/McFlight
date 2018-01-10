@@ -1,0 +1,271 @@
+#!/bin/sh
+
+# reduce the logging level of dmesg
+echo "0" > /proc/sys/kernel/printk
+
+echo "rcS init script ..." | ulogger -t "rcS" -p I
+
+source /bin/ardrone3_shell.sh
+
+
+#Setup memory pools
+echo $(( 20*1024 )) > /proc/sys/vm/min_free_kbytes
+echo 2 > /proc/sys/vm/min_free_order_shift
+
+# ON/OFF button monitoring
+dir="/sys/devices/platform/user_gpio/USER_ON_OFF"
+if [ -d ${dir} ]
+then
+  echo "both" > ${dir}/edge
+  (/usr/bin/gpio_monitor ${dir} /bin/onoffbutton > /dev/null) &
+else
+  user_on_off=$(cat /sys/kernel/hsis/user_on_off)
+  echo ${user_on_off} > /sys/class/gpio/export
+  dir="/sys/class/gpio/gpio${user_on_off}"
+  if [ -d ${dir} ]
+  then
+    echo "in" > ${dir}/direction
+    if [ -e ${dir}/edge ]; then
+      echo "both" > ${dir}/edge
+      (/usr/bin/gpio_monitor ${dir} /bin/onoffbutton > /dev/null) &
+    fi
+  fi
+fi
+
+# Add a symbolic link for each I2C sensor
+ln -s /dev/i2c-0 /dev/i2c-p7mu
+ln -s /dev/i2c-0 /dev/i2c-mt9f002
+ln -s /dev/i2c-0 /dev/i2c-mt9v117
+ln -s /dev/i2c-1 /dev/i2c-cypress
+ln -s /dev/i2c-1 /dev/i2c-akm8963
+ln -s /dev/i2c-1 /dev/i2c-ms5607
+ln -s /dev/i2c-2 /dev/i2c-mpu6050
+
+echo "Groups and priorities" | ulogger -t "rcS" -p I
+
+#create groups of priorities
+mkdir -p /dev/cpuctl
+mount -t cgroup -ocpu none /dev/cpuctl
+
+# control group
+mkdir -p /dev/cpuctl/control
+#touch /dev/cpuctl/control/cpu.shares
+#echo "8192" > /dev/cpuctl/control/cpu.shares
+
+# video group
+mkdir -p /dev/cpuctl/video
+#touch /dev/cpuctl/video/cpu.shares
+#echo "8192" > /dev/cpuctl/video/cpu.shares
+
+# network group
+mkdir -p /dev/cpuctl/network
+#touch /dev/cpuctl/network/cpu.shares
+#echo "2048" > /dev/cpuctl/network/cpu.shares
+
+# group others
+mkdir -p /dev/cpuctl/others
+#touch /dev/cpuctl/others/cpu.shares
+#echo "1024" >/dev/cpuctl/others/cpu.shares
+
+touch /dev/cpuctl/others/tasks
+for task in $(cat /dev/cpuctl/tasks)
+do
+  (echo $task > /dev/cpuctl/others/tasks) 2>/dev/null
+done
+
+ln -sf /proc/mounts /etc/mtab
+
+# Get serial number
+SERIAL_NUMBER=""
+
+if [ -f ${FACTORY_SERIAL_FILE} ]; then
+    SERIAL_NUMBER=$(cat ${FACTORY_SERIAL_FILE})
+fi
+
+# Be sure we have a config file
+if [ ! -s ${DRAGON_CONF} ]
+then
+    echo "No config found. Copying default config..." | ulogger -t "rcS" -p I
+    cp ${DEFAULT_DRAGON_CONF} ${DRAGON_CONF}
+    PRODUCT_NAME_MUST_CHANGE="1"
+    sync
+else
+    PRODUCT_NAME_MUST_CHANGE="0"
+fi
+
+PRODUCT_NAME=$(grep product_name ${DRAGON_CONF} | cut -d ':' -f 2- | cut -d '"' -f 2)
+
+if [ ! -z ${SERIAL_NUMBER} ]
+then
+    # If serial found, set product name (6 last digits)
+    echo "Serial number : ${SERIAL_NUMBER}" | ulogger -t "rcS" -p I
+    SHORT_SERIAL=$(echo -n ${SERIAL_NUMBER} | tail -c 6)
+    # Change only if product name is default
+    if [ "${PRODUCT_NAME_MUST_CHANGE}" == "1" ];
+    then
+        milos_black=$(gprop ro.factory.milos_black)
+        milos_flir=$(gprop ro.factory.milos_flir)
+        if [ ${milos_black} -eq 1 ]; then
+                PRODUCT_NAME_HEADER="Bebop2Power"
+        else
+            if [ ${milos_flir} -eq 1 ]; then
+                PRODUCT_NAME_HEADER="BebopProThermal"
+            else
+                PRODUCT_NAME_HEADER=$PRODUCT
+            fi
+        fi
+        # Report new name in dragon.conf
+        sed -i s@\"product_name\".*@\"product_name\"\ :\ \"${PRODUCT_NAME_HEADER}-${SHORT_SERIAL}\"@ ${DRAGON_CONF}
+        sync
+    fi
+fi
+
+# Set hostname accordingly
+PRODUCT_NAME=$(grep product_name ${DRAGON_CONF} | cut -d ':' -f 2- | cut -d '"' -f 2)
+
+echo "Product name : ${PRODUCT_NAME}" | ulogger -t "rcS" -p I
+hostname ${PRODUCT_NAME}
+
+# Set product.name in properties
+sprop product.name "${PRODUCT_NAME}"
+
+# Set trigger for software depending on product.name
+sprop product.name.set 1
+
+# Be sure we have a system config file
+if [ ! -s $SYSTEM_CONF ]
+then
+  cp $DEFAULT_SYSTEM_CONF $SYSTEM_CONF
+  sync
+fi
+
+# Start udev
+echo "Start udev" | ulogger -t "rcS" -p I
+/sbin/udevd.sh
+
+# Start USB storage (un-)mounting deamon
+mkdir -p /tmp/run
+echo "Start ujubaclient" | ulogger -t "rcS" -p I
+(/usr/bin/ujubaclient | ulogger -t "ujubaclient" -p I) &
+
+# Call Video config
+/etc/init.d/rcS_video
+
+# Call Vision config
+/etc/init.d/rcS_vision
+
+# Call IO config
+/etc/init.d/rcS_IO
+
+echo "Loading modules" | ulogger -t "rcS" -p I
+
+# Host USB modules
+modprobe ehci-hcd
+modprobe rndis_host
+
+modprobe mtdchar
+modprobe pl330
+modprobe m25p80
+
+modprobe rtc-p7mu
+
+#Vencoder
+modprobe hx280-venc
+
+# Video cameras
+modprobe avicam
+
+# P7 video scaler
+modprobe v4l2_mem2mem
+modprobe avi_m2m
+
+# Enabling ADC on P7mu
+modprobe p7muadc
+modprobe p7temp
+
+modprobe p7-spim
+modprobe spidev
+
+# Keep compatibility with old mykonos3 sw version
+if [ ! -f ${ARDRONE3_FILE_FVT6_DONE} -a -f ${ARDRONE3_FILE_FVT6_DONE_DRAGON_2_0} ]
+then
+    touch ${ARDRONE3_FILE_FVT6_DONE}
+fi
+
+mmcOK=1
+/etc/init.d/rcS_eMMC
+mmcOK=$?
+
+# start macgyver daemon (need emmc mounted)
+/usr/bin/macgyverd -f &
+
+# Call GPS specific
+/etc/init.d/rcS_gps
+
+(
+  /sbin/ifconfig lo 127.0.0.1 up && \
+  /sbin/route add -net 127.0.0.0 netmask 255.0.0.0 lo && \
+  pstart inetd
+)&
+
+# Avahi configuration
+echo "Start Avahi daemon" | ulogger -t "rcS" -p I
+rm -Rf /var/run/avahi-daemon/
+mkdir -p /var/run/avahi-daemon/
+mkdir -p /data/avahi/services/
+mkdir -p /tmp/avahi/services/
+find /tmp/avahi/services/ -type f -name "*.service" -exec rm {} \;
+pstart avahi-daemon
+
+# Load gpu modules
+/etc/init.d/rcS_gpu
+
+# Create virtual framebuffer
+modprobe vfb vfb_enable=1
+
+echo "Change spi1 thread priority to real time" | ulogger -t "rcS" -p I
+chrt -pf 99 $(pidof spi1) | ulogger -t "rcS" -p I
+
+# Try to get magic carpet and demo script files from USB if connected
+#/bin/demoCarpetUSBflashing.sh &
+
+DragonDebug.sh
+
+sprop state.debug 1
+
+echo "Check Update" | ulogger -t "rcS" -p I
+/bin/updater/updater_scan.sh /update
+/bin/updater/updater_scan.sh ${ARDRONE3_MOUNT_PATH}
+
+echo "Process Update" | ulogger -t "rcS" -p I
+/bin/updater/updater_process.sh
+
+# Check the front camera EEPROM
+/etc/init.d/rcS_eeprom
+
+# Start publisher service
+pstart publisherd
+
+# start wifi watchdog
+/usr/bin/bcm-watchdog &
+
+if [ -x /usr/bin/save_last_network_stats_files.sh ]
+then
+  save_last_network_stats_files.sh
+fi
+
+# at first boot copy default barometer compensation file
+# from /etc/colibry/<board>/ into /var/lib/colibry/ (RW partition)
+# only if destination file doesn't already exist (colibry will modify this file)
+COLIBRY_BARO_FILENAME="barometer_compensation.csv"
+COLIBRY_BARO_CSV_FILE_SRC="/etc/colibry/$(gprop ro.hardware)/${COLIBRY_BARO_FILENAME}"
+COLIBRY_BARO_CSV_FILE_DEST="/var/lib/colibry/${COLIBRY_BARO_FILENAME}"
+if [ -f ${COLIBRY_BARO_CSV_FILE_SRC} -a ! -f ${COLIBRY_BARO_CSV_FILE_DEST} ]
+then
+	mkdir -p $(dirname ${COLIBRY_BARO_CSV_FILE_DEST})
+	cp ${COLIBRY_BARO_CSV_FILE_SRC} ${COLIBRY_BARO_CSV_FILE_DEST}
+fi
+
+echo "rcS init script done" | ulogger -t "rcS" -p I
+
+exit 0
